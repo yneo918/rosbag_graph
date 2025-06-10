@@ -1,16 +1,4 @@
-def filter_topics(self, text: str):
-        """Filter topics based on search text"""
-        search_text = text.lower()
-        
-        for i in range(self.topics_list.count()):
-            item = self.topics_list.item(i)
-            topic = item.data(Qt.ItemDataRole.UserRole)
-            
-            # Show/hide based on search
-            if search_text in topic.lower():
-                item.setHidden(False)
-            else:
-                item.setHidden(True)#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 ROS2 Bag Data Visualizer with PyQt6
 
@@ -46,6 +34,7 @@ import os
 import json
 import array
 import inspect
+import threading
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
@@ -57,17 +46,34 @@ from PyQt6.QtWidgets import (
     QSplitter, QGroupBox, QComboBox, QLabel, QCheckBox,
     QTreeWidget, QTreeWidgetItem, QTabWidget, QMessageBox,
     QProgressBar, QStatusBar, QLineEdit, QSpinBox, QMenu,
-    QDialog, QDialogButtonBox, QFormLayout, QTextEdit
+    QDialog, QDialogButtonBox, QFormLayout, QTextEdit, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction, QKeyEvent
 
 import matplotlib
-matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+# Set matplotlib backend before importing other matplotlib modules
+matplotlib.use('QtAgg')  # Use QtAgg for PyQt6 compatibility
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+
+# Constants
+DEFAULT_ARRAY_DISPLAY_LIMIT = 20
+LARGE_ARRAY_THRESHOLD = 10
+MAX_ARRAY_PREVIEW = 100
+PROGRESS_UPDATE_INTERVAL = 100
+PROGRESS_VISUAL_UPDATE_INTERVAL = 50  # More frequent visual updates
+LINE_TRUNCATE_LENGTH = 2000
+VALUE_PREVIEW_LENGTH = 50
+
+# Loading progress phases
+PROGRESS_OPENING_BAG = 5       # 5% for opening bag
+PROGRESS_READING_METADATA = 10 # 10% for reading metadata
+PROGRESS_READING_MESSAGES = 90 # 90% for reading messages
+PROGRESS_FINALIZING = 98       # 98% for finalizing
+PROGRESS_COMPLETE = 100        # 100% complete
 
 try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
@@ -78,6 +84,27 @@ except ImportError:
     HAS_ROS2 = False
     print("Warning: ROS2 packages not found. Install rosbag2-py and rclpy.")
     print("For MCAP support, also install: ros-<distro>-rosbag2-storage-mcap")
+
+
+# Custom Exceptions
+class RosbagVisualizerError(Exception):
+    """Base exception for RosbagVisualizer"""
+    pass
+
+
+class BagFileError(RosbagVisualizerError):
+    """Exception raised when bag file operations fail"""
+    pass
+
+
+class MessageDeserializationError(RosbagVisualizerError):
+    """Exception raised when message deserialization fails"""
+    pass
+
+
+class PlotError(RosbagVisualizerError):
+    """Exception raised during plotting operations"""
+    pass
 
 class PlotPropertiesDialog(QDialog):
     """Dialog for editing plot properties"""
@@ -151,10 +178,22 @@ class DataLoaderThread(QThread):
         super().__init__()
         self.bag_path = bag_path
         self.storage_id = storage_id
-        self.is_cancelled = False
+        self._lock = threading.Lock()
+        self._is_cancelled = False
+    
+    @property
+    def is_cancelled(self):
+        with self._lock:
+            return self._is_cancelled
+    
+    def cancel(self):
+        """Cancel the loading process"""
+        with self._lock:
+            self._is_cancelled = True
         
     def run(self):
         """Load rosbag data"""
+        reader = None
         try:
             self.status.emit(f"Loading rosbag data from {os.path.basename(self.bag_path)}...")
             
@@ -169,12 +208,16 @@ class DataLoaderThread(QThread):
             
             try:
                 reader.open(storage_options, converter_options)
+            except (FileNotFoundError, OSError) as e:
+                raise BagFileError(f"Cannot access bag file: {str(e)}")
             except Exception as e:
-                self.error.emit(f"Failed to open bag file: {str(e)}\nMake sure you have the required rosbag2 storage plugin installed.")
-                return
+                raise BagFileError(f"Failed to open bag file: {str(e)}\n"
+                                 f"Make sure you have the required rosbag2 storage plugin installed.")
             
             # Get metadata
             topic_types = reader.get_all_topics_and_types()
+            self.progress.emit(PROGRESS_READING_METADATA)
+            self.status.emit("Reading bag metadata...")
             
             if not topic_types:
                 self.error.emit("No topics found in the bag file.")
@@ -194,10 +237,54 @@ class DataLoaderThread(QThread):
                 }
             
             # Read messages
+            self.status.emit("Loading messages...")
             total_messages = 0
+            processed_raw_messages = 0
+            last_progress = PROGRESS_READING_METADATA
+            
+            # First pass: count total messages for accurate progress
+            messages_to_process = 0
+            temp_reader = SequentialReader()
+            try:
+                temp_reader.open(storage_options, converter_options)
+                while temp_reader.has_next():
+                    temp_reader.read_next()
+                    messages_to_process += 1
+                temp_reader = None
+            except Exception:
+                # If counting fails, fall back to incremental progress
+                messages_to_process = 0
+            
             while reader.has_next() and not self.is_cancelled:
                 try:
                     (topic, data, timestamp) = reader.read_next()
+                    processed_raw_messages += 1
+                    
+                    # Update progress based on actual completion if we know total count
+                    if messages_to_process > 0:
+                        # Calculate accurate progress
+                        progress_percentage = PROGRESS_READING_METADATA + (
+                            (processed_raw_messages / messages_to_process) * 
+                            (PROGRESS_READING_MESSAGES - PROGRESS_READING_METADATA)
+                        )
+                        last_progress = min(progress_percentage, PROGRESS_READING_MESSAGES - 1)
+                    else:
+                        # Fallback to incremental progress
+                        if processed_raw_messages % PROGRESS_VISUAL_UPDATE_INTERVAL == 0:
+                            if last_progress < 30:
+                                increment = 1.5
+                            elif last_progress < 60:
+                                increment = 1.0
+                            elif last_progress < 85:
+                                increment = 0.8
+                            else:
+                                increment = 0.3
+                            last_progress = min(last_progress + increment, PROGRESS_READING_MESSAGES - 1)
+                    
+                    # Update progress every message for smooth progress
+                    if processed_raw_messages % max(1, PROGRESS_VISUAL_UPDATE_INTERVAL // 5) == 0:
+                        self.progress.emit(int(last_progress))
+                        self.status.emit(f"Processing messages... {processed_raw_messages} processed")
                     
                     if topic in topic_info:
                         # Get message type
@@ -215,31 +302,48 @@ class DataLoaderThread(QThread):
                             messages[topic].append(msg_dict)
                             topic_info[topic]['count'] += 1
                             total_messages += 1
-                            
-                            # Emit progress every 100 messages
-                            if total_messages % 100 == 0:
-                                self.progress.emit(total_messages)
-                                self.status.emit(f"Loaded {total_messages} messages...")
                                 
                         except Exception as e:
-                            print(f"Error deserializing message from {topic}: {e}")
+                            # Log but continue with other messages
+                            print(f"MessageDeserializationError for {topic}: {e}")
                             
                 except Exception as e:
                     print(f"Error reading message: {e}")
+                    processed_raw_messages += 1  # Count failed reads too
                     continue
             
+            # Ensure we reach the reading messages completion
+            self.progress.emit(PROGRESS_READING_MESSAGES)
+            self.status.emit(f"Completed processing {processed_raw_messages} messages")
+            
             # Prepare result
+            self.status.emit("Finalizing data...")
+            self.progress.emit(PROGRESS_FINALIZING)
+            
             result = {
                 'messages': dict(messages),
                 'topic_info': topic_info,
                 'total_messages': total_messages
             }
             
-            self.status.emit(f"Loaded {total_messages} messages from {len(messages)} topics")
+            self.progress.emit(PROGRESS_COMPLETE)
+            self.status.emit(f"Successfully loaded {total_messages} messages from {len(messages)} topics")
             self.finished.emit(result)
             
+        except BagFileError as e:
+            self.error.emit(str(e))
         except Exception as e:
-            self.error.emit(f"Error loading rosbag: {str(e)}")
+            self.error.emit(f"Unexpected error loading rosbag: {str(e)}")
+        finally:
+            # Ensure reader is properly closed
+            if reader is not None:
+                try:
+                    # SequentialReader doesn't have an explicit close method
+                    # The reader will be cleaned up when it goes out of scope
+                    reader = None
+                except Exception:
+                    # Ignore cleanup errors
+                    pass
     
     def _message_to_dict(self, msg) -> dict:
         """Convert ROS message to dictionary"""
@@ -300,9 +404,6 @@ class DataLoaderThread(QThread):
                 
         return result
     
-    def cancel(self):
-        """Cancel the loading process"""
-        self.is_cancelled = True
 
 
 class PlotCanvas(FigureCanvas):
@@ -318,48 +419,89 @@ class PlotCanvas(FigureCanvas):
         
         # Store plot data
         self.plot_data = []
+        self.plot_lines = {}
+        self._supports_elapsed_time = True
         
     def clear_plot(self):
         """Clear the plot"""
         self.ax.clear()
         self.ax.grid(True, alpha=0.3)
         self.plot_data = []
+        self.plot_lines = {}
         self.draw()
         
-    def plot_time_series(self, timestamps, values, label="", style="-"):
+    def plot_time_series(self, timestamps, values, label="", style="-", use_elapsed_time=False, time_origin=None):
         """Plot time series data"""
         if not timestamps or not values:
             print("Warning: No data to plot")
             return None
-            
-        # Convert timestamps to datetime
-        times = [datetime.fromtimestamp(t / 1e9) for t in timestamps]
+        
+        if use_elapsed_time:
+            # Convert to elapsed time
+            if time_origin is None:
+                time_origin = timestamps[0]
+            times = [(t - time_origin) / 1e9 for t in timestamps]  # Convert to seconds
+            xlabel = "Elapsed Time (s)"
+        else:
+            # Convert timestamps to datetime
+            times = [datetime.fromtimestamp(t / 1e9) for t in timestamps]
+            xlabel = "Time"
         
         # Plot data
         line = self.ax.plot(times, values, style, label=label)[0]
+        if hasattr(self, 'plot_lines'):
+            self.plot_lines[label] = line
+        else:
+            self.plot_lines = {label: line}
         
         # Format x-axis
-        self.figure.autofmt_xdate()
+        if not use_elapsed_time:
+            self.figure.autofmt_xdate()
         
         if label:
             self.ax.legend()
             
-        self.ax.set_xlabel("Time")
+        self.ax.set_xlabel(xlabel)
         self.ax.set_ylabel("Value")
+        self.ax.grid(True, alpha=0.3)
         
         self.draw()
         return line
         
     def plot_xy(self, x_values, y_values, label="", style="-"):
         """Plot X-Y data"""
+        if not x_values or not y_values:
+            print("Warning: No data to plot")
+            return None
+            
         line = self.ax.plot(x_values, y_values, style, label=label)[0]
+        if hasattr(self, 'plot_lines'):
+            self.plot_lines[label] = line
+        else:
+            self.plot_lines = {label: line}
         
         if label:
             self.ax.legend()
             
         self.draw()
         return line
+    
+    def get_plot_info(self):
+        """Get plot information"""
+        legends = []
+        if hasattr(self, 'plot_lines') and self.plot_lines:
+            legends = list(self.plot_lines.keys())
+        elif self.ax.get_legend():
+            handles, labels = self.ax.get_legend_handles_labels()
+            legends = labels
         
+        return {
+            'title': self.ax.get_title(),
+            'xlabel': self.ax.get_xlabel(),
+            'ylabel': self.ax.get_ylabel(),
+            'legends': legends
+        }
+    
     def update_labels(self, xlabel="", ylabel="", title=""):
         """Update plot labels"""
         if xlabel:
@@ -369,6 +511,52 @@ class PlotCanvas(FigureCanvas):
         if title:
             self.ax.set_title(title)
         self.draw()
+    
+    def update_legend_labels(self, label_map):
+        """Update legend labels"""
+        if hasattr(self, 'plot_lines'):
+            for old_label, new_label in label_map.items():
+                if old_label in self.plot_lines:
+                    line = self.plot_lines[old_label]
+                    line.set_label(new_label)
+                    self.plot_lines[new_label] = self.plot_lines.pop(old_label)
+        else:
+            if self.ax.get_legend():
+                handles, labels = self.ax.get_legend_handles_labels()
+                new_labels = []
+                for label in labels:
+                    new_labels.append(label_map.get(label, label))
+                self.ax.legend(handles, new_labels)
+                self.draw()
+                return
+        
+        self.ax.legend()
+        self.draw()
+    
+    def remove_plot_line(self, label):
+        """Remove a specific plot line"""
+        if hasattr(self, 'plot_lines') and label in self.plot_lines:
+            line = self.plot_lines[label]
+            line.remove()
+            del self.plot_lines[label]
+            
+            # Update legend
+            if self.plot_lines:
+                self.ax.legend()
+            else:
+                legend = self.ax.get_legend()
+                if legend:
+                    legend.remove()
+            
+            self.draw()
+            return True
+        return False
+    
+    def get_plot_lines(self):
+        """Get list of plot line labels"""
+        if hasattr(self, 'plot_lines'):
+            return list(self.plot_lines.keys())
+        return []
 
 
 class DataFieldSelector(QWidget):
@@ -434,19 +622,19 @@ class DataFieldSelector(QWidget):
                         if len(value) > 0 and isinstance(value[0], (int, float, str, bool)):
                             # For simple arrays, create individual index items
                             # Check if this is a large array that needs expansion option
-                            if len(value) > 20:
+                            if len(value) > DEFAULT_ARRAY_DISPLAY_LIMIT:
                                 expand_item = QTreeWidgetItem(item)
                                 expand_item.setText(0, f"[Double-click to show all {len(value)} elements]")
                                 expand_item.setText(1, "expand")
                                 expand_item.setData(0, Qt.ItemDataRole.UserRole, None)
                             
                             # Show first N elements by default
-                            show_count = min(len(value), 20)
+                            show_count = min(len(value), DEFAULT_ARRAY_DISPLAY_LIMIT)
                             for idx in range(show_count):
                                 idx_item = QTreeWidgetItem(item)
                                 idx_item.setText(0, f"[{idx}]")
                                 idx_item.setText(1, type(value[idx]).__name__)
-                                idx_item.setText(2, str(value[idx])[:50])
+                                idx_item.setText(2, str(value[idx])[:VALUE_PREVIEW_LENGTH])
                                 idx_item.setData(0, Qt.ItemDataRole.UserRole, new_path + [idx])
                                 
                             if len(value) > show_count:
@@ -456,7 +644,7 @@ class DataFieldSelector(QWidget):
                                 more_item.setData(0, Qt.ItemDataRole.UserRole, None)
                         elif len(value) > 0 and isinstance(value[0], dict):
                             # For arrays of complex objects
-                            if len(value) > 10:
+                            if len(value) > LARGE_ARRAY_THRESHOLD:
                                 # Add expansion option for large arrays
                                 expand_item = QTreeWidgetItem(item)
                                 expand_item.setText(0, f"[Double-click to expand {len(value)} elements]")
@@ -485,11 +673,11 @@ class DataFieldSelector(QWidget):
                         empty_item.setText(1, "info")
                 else:
                     item.setText(1, type(value).__name__)
-                    item.setText(2, str(value)[:50])
+                    item.setText(2, str(value)[:VALUE_PREVIEW_LENGTH])
                     
         elif isinstance(data, list) and data:
             # Handle list at root level
-            for i, item_data in enumerate(data[:100]):  # Show first 100 elements
+            for i, item_data in enumerate(data[:MAX_ARRAY_PREVIEW]):  # Show first MAX_ARRAY_PREVIEW elements
                 item = QTreeWidgetItem(parent)
                 item.setText(0, f"[{i}]")
                 new_path = path + [i]
@@ -500,7 +688,7 @@ class DataFieldSelector(QWidget):
                     self._add_fields_to_tree(item, item_data, new_path)
                 else:
                     item.setText(1, type(item_data).__name__)
-                    item.setText(2, str(item_data)[:50])
+                    item.setText(2, str(item_data)[:VALUE_PREVIEW_LENGTH])
                     
     def on_item_clicked(self, item: QTreeWidgetItem, column: int):
         """Handle item click"""
@@ -711,6 +899,9 @@ class RosbagVisualizer(QMainWindow):
         # Create progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
         self.status_bar.addPermanentWidget(self.progress_bar)
         
     def create_menu_bar(self):
@@ -764,6 +955,13 @@ class RosbagVisualizer(QMainWindow):
         edit_plot_action.setShortcut("Ctrl+E")
         edit_plot_action.triggered.connect(self.edit_plot_properties)
         view_menu.addAction(edit_plot_action)
+        
+        view_menu.addSeparator()
+        
+        remove_line_action = QAction("Remove Plot Line", self)
+        remove_line_action.setShortcut("Ctrl+D")
+        remove_line_action.triggered.connect(self.remove_plot_line)
+        view_menu.addAction(remove_line_action)
         
     def create_left_panel(self):
         """Create left panel with controls"""
@@ -850,6 +1048,49 @@ class RosbagVisualizer(QMainWindow):
         
         controls_layout.addWidget(self.time_options_widget)
         
+        # Data time range options
+        self.time_range_widget = QWidget()
+        time_range_layout = QVBoxLayout(self.time_range_widget)
+        
+        # Enable time range filtering
+        time_filter_layout = QHBoxLayout()
+        self.time_filter_checkbox = QCheckBox("Filter by Time Range")
+        self.time_filter_checkbox.setChecked(False)
+        self.time_filter_checkbox.toggled.connect(self.on_time_filter_toggled)
+        self.time_filter_checkbox.setToolTip("Enable to filter data by specific time range")
+        time_filter_layout.addWidget(self.time_filter_checkbox)
+        time_range_layout.addLayout(time_filter_layout)
+        
+        # Time range controls
+        time_controls_layout = QVBoxLayout()
+        
+        # Start time
+        start_time_layout = QHBoxLayout()
+        start_time_layout.addWidget(QLabel("Start Time (s):"))
+        self.start_time_spinbox = QDoubleSpinBox()
+        self.start_time_spinbox.setRange(0.0, 999999.0)
+        self.start_time_spinbox.setValue(0.0)
+        self.start_time_spinbox.setDecimals(3)
+        self.start_time_spinbox.setEnabled(False)
+        self.start_time_spinbox.setToolTip("Start time in seconds from bag beginning")
+        start_time_layout.addWidget(self.start_time_spinbox)
+        time_controls_layout.addLayout(start_time_layout)
+        
+        # End time
+        end_time_layout = QHBoxLayout()
+        end_time_layout.addWidget(QLabel("End Time (s):"))
+        self.end_time_spinbox = QDoubleSpinBox()
+        self.end_time_spinbox.setRange(0.0, 999999.0)
+        self.end_time_spinbox.setValue(100.0)
+        self.end_time_spinbox.setDecimals(3)
+        self.end_time_spinbox.setEnabled(False)
+        self.end_time_spinbox.setToolTip("End time in seconds from bag beginning")
+        end_time_layout.addWidget(self.end_time_spinbox)
+        time_controls_layout.addLayout(end_time_layout)
+        
+        time_range_layout.addLayout(time_controls_layout)
+        controls_layout.addWidget(self.time_range_widget)
+        
         # Add plot button
         self.add_plot_btn = QPushButton("Add to Plot")
         self.add_plot_btn.clicked.connect(self.add_to_plot)
@@ -868,6 +1109,12 @@ class RosbagVisualizer(QMainWindow):
         self.edit_plot_btn.clicked.connect(self.edit_plot_properties)
         self.edit_plot_btn.setToolTip("Edit title, axis labels, and legend names (Ctrl+E)")
         controls_layout.addWidget(self.edit_plot_btn)
+        
+        # Remove plot line button
+        self.remove_line_btn = QPushButton("Remove Plot Line")
+        self.remove_line_btn.clicked.connect(self.remove_plot_line)
+        self.remove_line_btn.setToolTip("Remove a specific plot line (Ctrl+D)")
+        controls_layout.addWidget(self.remove_line_btn)
         
         plot_controls.setLayout(controls_layout)
         layout.addWidget(plot_controls)
@@ -888,12 +1135,24 @@ class RosbagVisualizer(QMainWindow):
         # Install event filter for keyboard shortcuts
         self.selected_fields_list.installEventFilter(self)
         
+        # Button layout
+        button_layout = QHBoxLayout()
+        
         # Remove selected button
         self.remove_selected_btn = QPushButton("Remove Selected")
         self.remove_selected_btn.clicked.connect(self.remove_selected_fields)
         self.remove_selected_btn.setEnabled(False)
         self.remove_selected_btn.setToolTip("Remove selected fields (Delete key)")
-        selected_layout.addWidget(self.remove_selected_btn)
+        button_layout.addWidget(self.remove_selected_btn)
+        
+        # Clear all button
+        self.clear_all_fields_btn = QPushButton("Clear All")
+        self.clear_all_fields_btn.clicked.connect(self.clear_all_fields_with_confirmation)
+        self.clear_all_fields_btn.setEnabled(False)
+        self.clear_all_fields_btn.setToolTip("Remove all selected fields with confirmation")
+        button_layout.addWidget(self.clear_all_fields_btn)
+        
+        selected_layout.addLayout(button_layout)
         
         selected_group.setLayout(selected_layout)
         layout.addWidget(selected_group)
@@ -938,7 +1197,7 @@ class RosbagVisualizer(QMainWindow):
         self.plot_tabs.setToolTip("Double-click tab name to rename, drag to reorder")
         layout.addWidget(self.plot_tabs)
         
-        # Create first plot tab
+        # Create first plot tab (no specific plot type initially)
         self.add_plot_tab()
         self.update_tab_info()
         
@@ -952,15 +1211,24 @@ class RosbagVisualizer(QMainWindow):
         
         return panel
         
-    def add_plot_tab(self, title=None):
+    def add_plot_tab(self, title=None, plot_type=None, time_mode=None):
         """Add a new plot tab"""
         if title is None:
-            # Generate unique title
+            # Generate unique title based on plot type and time mode
             existing_titles = [self.plot_tabs.tabText(i) for i in range(self.plot_tabs.count())]
             plot_num = 1
-            while f"Plot {plot_num}" in existing_titles:
+            
+            if plot_type == "Time Series" and time_mode:
+                time_suffix = " (Elapsed)" if time_mode == "Elapsed Time" else " (Absolute)"
+                base_title = f"{plot_type}{time_suffix} "
+            elif plot_type:
+                base_title = f"{plot_type} "
+            else:
+                base_title = "Plot "
+                
+            while f"{base_title}{plot_num}" in existing_titles:
                 plot_num += 1
-            title = f"Plot {plot_num}"
+            title = f"{base_title}{plot_num}"
         
         # Create plot widget
         plot_widget = QWidget()
@@ -971,6 +1239,12 @@ class RosbagVisualizer(QMainWindow):
         
         # Ensure canvas has all required methods
         self._ensure_canvas_compatibility(canvas)
+        
+        # Store plot type and time mode in widget properties
+        if plot_type:
+            plot_widget.setProperty("plot_type", plot_type)
+        if time_mode:
+            plot_widget.setProperty("time_mode", time_mode)
         
         plot_layout.addWidget(canvas)
         
@@ -983,6 +1257,32 @@ class RosbagVisualizer(QMainWindow):
         self.plot_tabs.setCurrentIndex(index)
         
         return canvas
+    
+    def get_current_tab_plot_type(self):
+        """Get the plot type of the current tab"""
+        current_tab = self.plot_tabs.currentWidget()
+        if current_tab:
+            return current_tab.property("plot_type")
+        return None
+    
+    def get_current_tab_time_mode(self):
+        """Get the time mode of the current tab"""
+        current_tab = self.plot_tabs.currentWidget()
+        if current_tab:
+            return current_tab.property("time_mode")
+        return None
+    
+    def set_current_tab_plot_type(self, plot_type):
+        """Set the plot type of the current tab"""
+        current_tab = self.plot_tabs.currentWidget()
+        if current_tab:
+            current_tab.setProperty("plot_type", plot_type)
+    
+    def set_current_tab_time_mode(self, time_mode):
+        """Set the time mode of the current tab"""
+        current_tab = self.plot_tabs.currentWidget()
+        if current_tab:
+            current_tab.setProperty("time_mode", time_mode)
         
     def _ensure_canvas_compatibility(self, canvas):
         """Ensure canvas has all required methods for compatibility"""
@@ -1041,7 +1341,8 @@ class RosbagVisualizer(QMainWindow):
             # Replace the method
             canvas.plot_time_series = plot_time_series.__get__(canvas, PlotCanvas)
         
-        # Add clear_plot if missing
+        
+        # Add other required methods
         if not hasattr(canvas, 'clear_plot'):
             def clear_plot(self):
                 self.ax.clear()
@@ -1055,65 +1356,6 @@ class RosbagVisualizer(QMainWindow):
                 self.draw()
             canvas.clear_plot = clear_plot.__get__(canvas, PlotCanvas)
         
-        # Add get_plot_info if missing
-        if not hasattr(canvas, 'get_plot_info'):
-            def get_plot_info(self):
-                legends = []
-                
-                # Try to get legends from plot_lines first
-                if hasattr(self, 'plot_lines') and self.plot_lines:
-                    legends = list(self.plot_lines.keys())
-                # Fallback to get legends from the axes
-                elif self.ax.get_legend():
-                    handles, labels = self.ax.get_legend_handles_labels()
-                    legends = labels
-                
-                return {
-                    'title': self.ax.get_title(),
-                    'xlabel': self.ax.get_xlabel(),
-                    'ylabel': self.ax.get_ylabel(),
-                    'legends': legends
-                }
-            canvas.get_plot_info = get_plot_info.__get__(canvas, PlotCanvas)
-        
-        # Add update_labels if missing
-        if not hasattr(canvas, 'update_labels'):
-            def update_labels(self, xlabel="", ylabel="", title=""):
-                if xlabel:
-                    self.ax.set_xlabel(xlabel)
-                if ylabel:
-                    self.ax.set_ylabel(ylabel)
-                if title:
-                    self.ax.set_title(title)
-                self.draw()
-            canvas.update_labels = update_labels.__get__(canvas, PlotCanvas)
-        
-        # Add update_legend_labels if missing
-        if not hasattr(canvas, 'update_legend_labels'):
-            def update_legend_labels(self, label_map):
-                # Update lines if plot_lines exists
-                if hasattr(self, 'plot_lines'):
-                    for old_label, new_label in label_map.items():
-                        if old_label in self.plot_lines:
-                            line = self.plot_lines[old_label]
-                            line.set_label(new_label)
-                            self.plot_lines[new_label] = self.plot_lines.pop(old_label)
-                else:
-                    # Fallback: update legend directly
-                    if self.ax.get_legend():
-                        handles, labels = self.ax.get_legend_handles_labels()
-                        new_labels = []
-                        for label in labels:
-                            new_labels.append(label_map.get(label, label))
-                        self.ax.legend(handles, new_labels)
-                        self.draw()
-                        return
-                
-                self.ax.legend()
-                self.draw()
-            canvas.update_legend_labels = update_legend_labels.__get__(canvas, PlotCanvas)
-        
-        # Add plot_xy if missing
         if not hasattr(canvas, 'plot_xy'):
             def plot_xy(self, x_values, y_values, label="", style="-"):
                 if not x_values or not y_values:
@@ -1133,17 +1375,95 @@ class RosbagVisualizer(QMainWindow):
                 return line
             canvas.plot_xy = plot_xy.__get__(canvas, PlotCanvas)
         
-        # Ensure plot_lines dict exists
+        if not hasattr(canvas, 'get_plot_info'):
+            def get_plot_info(self):
+                legends = []
+                if hasattr(self, 'plot_lines') and self.plot_lines:
+                    legends = list(self.plot_lines.keys())
+                elif self.ax.get_legend():
+                    handles, labels = self.ax.get_legend_handles_labels()
+                    legends = labels
+                
+                return {
+                    'title': self.ax.get_title(),
+                    'xlabel': self.ax.get_xlabel(),
+                    'ylabel': self.ax.get_ylabel(),
+                    'legends': legends
+                }
+            canvas.get_plot_info = get_plot_info.__get__(canvas, PlotCanvas)
+        
+        if not hasattr(canvas, 'update_labels'):
+            def update_labels(self, xlabel="", ylabel="", title=""):
+                if xlabel:
+                    self.ax.set_xlabel(xlabel)
+                if ylabel:
+                    self.ax.set_ylabel(ylabel)
+                if title:
+                    self.ax.set_title(title)
+                self.draw()
+            canvas.update_labels = update_labels.__get__(canvas, PlotCanvas)
+        
+        if not hasattr(canvas, 'update_legend_labels'):
+            def update_legend_labels(self, label_map):
+                if hasattr(self, 'plot_lines'):
+                    for old_label, new_label in label_map.items():
+                        if old_label in self.plot_lines:
+                            line = self.plot_lines[old_label]
+                            line.set_label(new_label)
+                            self.plot_lines[new_label] = self.plot_lines.pop(old_label)
+                else:
+                    if self.ax.get_legend():
+                        handles, labels = self.ax.get_legend_handles_labels()
+                        new_labels = []
+                        for label in labels:
+                            new_labels.append(label_map.get(label, label))
+                        self.ax.legend(handles, new_labels)
+                        self.draw()
+                        return
+                
+                self.ax.legend()
+                self.draw()
+            canvas.update_legend_labels = update_legend_labels.__get__(canvas, PlotCanvas)
+        
+        if not hasattr(canvas, 'remove_plot_line'):
+            def remove_plot_line(self, label):
+                if hasattr(self, 'plot_lines') and label in self.plot_lines:
+                    line = self.plot_lines[label]
+                    line.remove()
+                    del self.plot_lines[label]
+                    
+                    # Update legend
+                    if self.plot_lines:
+                        self.ax.legend()
+                    else:
+                        legend = self.ax.get_legend()
+                        if legend:
+                            legend.remove()
+                    
+                    self.draw()
+                    return True
+                return False
+            canvas.remove_plot_line = remove_plot_line.__get__(canvas, PlotCanvas)
+        
+        if not hasattr(canvas, 'get_plot_lines'):
+            def get_plot_lines(self):
+                if hasattr(self, 'plot_lines'):
+                    return list(self.plot_lines.keys())
+                return []
+            canvas.get_plot_lines = get_plot_lines.__get__(canvas, PlotCanvas)
+        
+        # Ensure attributes exist
         if not hasattr(canvas, 'plot_lines'):
             canvas.plot_lines = {}
-        
-        # Ensure _supports_elapsed_time flag exists
         if not hasattr(canvas, '_supports_elapsed_time'):
             canvas._supports_elapsed_time = True
         
     def add_new_plot_tab(self):
         """Add a new plot tab"""
-        self.add_plot_tab()
+        # Use current settings for new tab
+        plot_type = self.plot_type_combo.currentText()
+        time_mode = self.time_mode_combo.currentText() if plot_type == "Time Series" else None
+        self.add_plot_tab(plot_type=plot_type, time_mode=time_mode)
         self.update_tab_info()
         
     def close_current_tab(self):
@@ -1198,20 +1518,30 @@ class RosbagVisualizer(QMainWindow):
     def on_selected_field_changed(self):
         """Handle selection change in selected fields list"""
         has_selection = len(self.selected_fields_list.selectedItems()) > 0
+        has_items = self.selected_fields_list.count() > 0
+        
         self.remove_selected_btn.setEnabled(has_selection)
+        self.clear_all_fields_btn.setEnabled(has_items)
         
     def show_field_context_menu(self, position):
         """Show context menu for selected fields"""
+        menu = QMenu()
+        
+        # Check if there's an item at the position
         item = self.selected_fields_list.itemAt(position)
         if item:
-            menu = QMenu()
-            
             remove_action = menu.addAction("Remove")
             remove_action.triggered.connect(lambda: self.remove_field_item(item))
-            
-            remove_all_action = menu.addAction("Remove All")
-            remove_all_action.triggered.connect(self.remove_all_fields)
-            
+            menu.addSeparator()
+        
+        # Always show clear all option if there are items
+        if self.selected_fields_list.count() > 0:
+            clear_all_action = menu.addAction("Clear All...")
+            clear_all_action.triggered.connect(self.clear_all_fields_with_confirmation)
+            clear_all_action.setToolTip("Remove all selected fields with confirmation")
+        
+        # Only show menu if there are actions
+        if menu.actions():
             menu.exec(self.selected_fields_list.mapToGlobal(position))
             
     def remove_field_item(self, item: QListWidgetItem):
@@ -1222,6 +1552,7 @@ class RosbagVisualizer(QMainWindow):
         # Update button state
         if self.selected_fields_list.count() == 0:
             self.add_plot_btn.setEnabled(False)
+            self.clear_all_fields_btn.setEnabled(False)
             
     def remove_selected_fields(self):
         """Remove selected field items"""
@@ -1233,11 +1564,32 @@ class RosbagVisualizer(QMainWindow):
         # Update button state
         if self.selected_fields_list.count() == 0:
             self.add_plot_btn.setEnabled(False)
+            self.clear_all_fields_btn.setEnabled(False)
             
     def remove_all_fields(self):
         """Remove all field items"""
         self.selected_fields_list.clear()
         self.add_plot_btn.setEnabled(False)
+        self.clear_all_fields_btn.setEnabled(False)
+    
+    def clear_all_fields_with_confirmation(self):
+        """Remove all field items with confirmation dialog"""
+        if self.selected_fields_list.count() == 0:
+            return
+        
+        # Show confirmation dialog
+        field_count = self.selected_fields_list.count()
+        reply = QMessageBox.question(
+            self,
+            "Clear All Selected Fields",
+            f"Are you sure you want to remove all {field_count} selected fields?\n\n"
+            f"This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No  # Default to No for safety
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.remove_all_fields()
         
     def rename_current_tab(self):
         """Rename the current tab"""
@@ -1340,7 +1692,8 @@ class RosbagVisualizer(QMainWindow):
         
         # Show progress
         self.progress_bar.setVisible(True)
-        self.status_bar.showMessage(f"Loading rosbag data from {bag_file}...")
+        self.progress_bar.setValue(0)
+        self.status_bar.showMessage(f"Starting to load {bag_file}...")
         
         # Create loader thread
         bag_path = os.path.join(directory, bag_file)
@@ -1351,9 +1704,9 @@ class RosbagVisualizer(QMainWindow):
         self.loader_thread.error.connect(self.on_load_error)
         self.loader_thread.start()
         
-    def on_load_progress(self, count: int):
+    def on_load_progress(self, progress: int):
         """Handle load progress"""
-        self.progress_bar.setValue(count)
+        self.progress_bar.setValue(min(progress, 100))
         
     def on_load_status(self, status: str):
         """Handle load status"""
@@ -1362,15 +1715,24 @@ class RosbagVisualizer(QMainWindow):
     def on_load_finished(self, data: dict):
         """Handle load finished"""
         self.bag_data = data
-        self.progress_bar.setVisible(False)
+        
+        # Ensure progress bar shows 100% before hiding
+        self.progress_bar.setValue(100)
         
         # Update topics list
         for topic, info in data['topic_info'].items():
             item = QListWidgetItem(f"{topic} ({info['count']} messages)")
             item.setData(Qt.ItemDataRole.UserRole, topic)
             self.topics_list.addItem(item)
-            
-        self.status_bar.showMessage("Rosbag loaded successfully")
+        
+        # Update time range limits
+        self.update_time_range_limits()
+        
+        # Brief delay to show 100% completion, then hide
+        QTimer.singleShot(200, lambda: (
+            self.progress_bar.setVisible(False),
+            self.status_bar.showMessage(f"Loaded {data['total_messages']} messages from {len(data['topic_info'])} topics")
+        ))
         
     def on_plot_type_changed(self, plot_type: str):
         """Handle plot type change"""
@@ -1381,6 +1743,41 @@ class RosbagVisualizer(QMainWindow):
         """Handle time mode change"""
         # Enable/disable origin combo based on mode
         self.time_origin_combo.setEnabled(mode == "Elapsed Time")
+        
+    def on_time_filter_toggled(self, checked: bool):
+        """Handle time filter checkbox toggle"""
+        self.start_time_spinbox.setEnabled(checked)
+        self.end_time_spinbox.setEnabled(checked)
+        
+        # Auto-update time range when enabled if data is loaded
+        if checked and hasattr(self, 'bag_data') and self.bag_data:
+            self.update_time_range_limits()
+    
+    def update_time_range_limits(self):
+        """Update time range spinbox limits based on loaded data"""
+        if not hasattr(self, 'bag_data') or not self.bag_data:
+            return
+        
+        # Find earliest and latest timestamps
+        all_first_times = []
+        all_last_times = []
+        
+        for topic_messages in self.bag_data['messages'].values():
+            if topic_messages:
+                all_first_times.append(topic_messages[0]['_timestamp'])
+                all_last_times.append(topic_messages[-1]['_timestamp'])
+        
+        if all_first_times and all_last_times:
+            min_time_ns = min(all_first_times)
+            max_time_ns = max(all_last_times)
+            
+            # Convert to seconds relative to start
+            duration_s = (max_time_ns - min_time_ns) / 1e9
+            
+            # Update spinbox ranges and values
+            self.start_time_spinbox.setMaximum(duration_s)
+            self.end_time_spinbox.setMaximum(duration_s)
+            self.end_time_spinbox.setValue(duration_s)
         
     def edit_plot_properties(self):
         """Edit current plot properties"""
@@ -1464,17 +1861,45 @@ class RosbagVisualizer(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole, (topic, field_path))
         self.selected_fields_list.addItem(item)
         
-        # Enable add plot button
+        # Enable buttons
         self.add_plot_btn.setEnabled(True)
+        self.clear_all_fields_btn.setEnabled(True)
         
     def extract_field_data(self, messages: List[dict], field_path: List[str]) -> Tuple[List[float], List[Any]]:
         """Extract field data from messages"""
         timestamps = []
         values = []
         
+        # Get time range filtering settings
+        use_time_filter = self.time_filter_checkbox.isChecked()
+        start_time_s = self.start_time_spinbox.value()
+        end_time_s = self.end_time_spinbox.value()
+        
+        # Calculate time range in nanoseconds if filtering is enabled
+        start_time_ns = None
+        end_time_ns = None
+        if use_time_filter and messages:
+            # Find the earliest timestamp in the entire bag
+            all_first_times = []
+            for topic_messages in self.bag_data['messages'].values():
+                if topic_messages:
+                    all_first_times.append(topic_messages[0]['_timestamp'])
+            
+            if all_first_times:
+                bag_start_time = min(all_first_times)
+                start_time_ns = bag_start_time + (start_time_s * 1e9)
+                end_time_ns = bag_start_time + (end_time_s * 1e9)
+        
         for msg in messages:
             # Get timestamp
-            timestamps.append(msg['_timestamp'])
+            timestamp = msg['_timestamp']
+            
+            # Apply time filter if enabled
+            if use_time_filter and start_time_ns is not None and end_time_ns is not None:
+                if timestamp < start_time_ns or timestamp > end_time_ns:
+                    continue
+            
+            timestamps.append(timestamp)
             
             # Navigate to field
             value = msg
@@ -1510,19 +1935,45 @@ class RosbagVisualizer(QMainWindow):
         if self.selected_fields_list.count() == 0:
             return
             
-        # Get current plot canvas
-        current_tab = self.plot_tabs.currentWidget()
-        if not current_tab:
-            return
-            
-        canvas = current_tab.findChild(PlotCanvas)
-        if not canvas:
-            return
+        plot_type = self.plot_type_combo.currentText()
+        time_mode = self.time_mode_combo.currentText() if plot_type == "Time Series" else None
+        
+        # Check if current tab has different plot configuration
+        current_tab_plot_type = self.get_current_tab_plot_type()
+        current_tab_time_mode = self.get_current_tab_time_mode()
+        
+        needs_new_tab = False
+        
+        # Check if plot type is different
+        if current_tab_plot_type and current_tab_plot_type != plot_type:
+            needs_new_tab = True
+        
+        # For Time Series, also check if time mode is different
+        if (not needs_new_tab and plot_type == "Time Series" and 
+            current_tab_time_mode and current_tab_time_mode != time_mode):
+            needs_new_tab = True
+        
+        if needs_new_tab:
+            # Create new tab for different configuration
+            canvas = self.add_plot_tab(plot_type=plot_type, time_mode=time_mode)
+        else:
+            # Use current tab
+            current_tab = self.plot_tabs.currentWidget()
+            if not current_tab:
+                # No tab exists, create first one
+                canvas = self.add_plot_tab(plot_type=plot_type, time_mode=time_mode)
+            else:
+                canvas = current_tab.findChild(PlotCanvas)
+                if not canvas:
+                    return
+                # Set plot type and time mode if not set
+                if not current_tab_plot_type:
+                    self.set_current_tab_plot_type(plot_type)
+                if plot_type == "Time Series" and not current_tab_time_mode:
+                    self.set_current_tab_time_mode(time_mode)
         
         # Ensure canvas has all required methods
         self._ensure_canvas_compatibility(canvas)
-            
-        plot_type = self.plot_type_combo.currentText()
         
         try:
             if plot_type == "Time Series":
@@ -1536,26 +1987,32 @@ class RosbagVisualizer(QMainWindow):
                         # Will use first timestamp as origin
                         time_origin = None
                     elif origin_mode == "Bag Start Time":
-                        # Find earliest timestamp in all messages
-                        earliest_time = float('inf')
-                        for topic_messages in self.bag_data['messages'].values():
-                            if topic_messages:
-                                first_time = topic_messages[0]['_timestamp']
-                                earliest_time = min(earliest_time, first_time)
-                        time_origin = earliest_time if earliest_time != float('inf') else None
+                        # Find earliest timestamp efficiently
+                        first_timestamps = [
+                            topic_messages[0]['_timestamp'] 
+                            for topic_messages in self.bag_data['messages'].values() 
+                            if topic_messages
+                        ]
+                        time_origin = min(first_timestamps) if first_timestamps else None
                     elif origin_mode == "Custom Time":
                         # Show dialog to input custom time
                         from PyQt6.QtWidgets import QInputDialog
                         
-                        # Get current time range from data
-                        all_times = []
-                        for topic_messages in self.bag_data['messages'].values():
-                            for msg in topic_messages:
-                                all_times.append(msg['_timestamp'])
+                        # Get current time range efficiently
+                        all_first_times = [
+                            topic_messages[0]['_timestamp'] 
+                            for topic_messages in self.bag_data['messages'].values() 
+                            if topic_messages
+                        ]
+                        all_last_times = [
+                            topic_messages[-1]['_timestamp'] 
+                            for topic_messages in self.bag_data['messages'].values() 
+                            if topic_messages
+                        ]
                         
-                        if all_times:
-                            min_time = min(all_times)
-                            max_time = max(all_times)
+                        if all_first_times and all_last_times:
+                            min_time = min(all_first_times)
+                            max_time = max(all_last_times)
                             
                             # Convert to seconds for display
                             min_sec = min_time / 1e9
@@ -1589,18 +2046,6 @@ class RosbagVisualizer(QMainWindow):
                         
                         # Filter out None values
                         valid_data = [(t, v) for t, v in zip(timestamps, values) if v is not None]
-                        if valid_data:
-                            timestamps, values = zip(*valid_data)
-                            
-                            # Create label with proper formatting
-                            label_parts = [topic]
-                            for f in field_path:
-                                if isinstance(f, int):
-                                    label_parts.append(f"[{f}]")
-                                else:
-                                    label_parts.append(f".{f}")
-                            label = ''.join(label_parts)
-                            
                         if valid_data:
                             timestamps, values = zip(*valid_data)
                             
@@ -1717,9 +2162,7 @@ class RosbagVisualizer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to plot data: {str(e)}")
             
-        # Clear selected fields
-        self.selected_fields_list.clear()
-        self.add_plot_btn.setEnabled(False)
+        # Don't clear selected fields to allow easy re-plotting
         
     def clear_current_plot(self):
         """Clear the current plot"""
@@ -1749,6 +2192,44 @@ class RosbagVisualizer(QMainWindow):
                         # Ensure canvas has all required methods
                         self._ensure_canvas_compatibility(canvas)
                         canvas.clear_plot()
+    
+    def remove_plot_line(self):
+        """Remove a specific plot line"""
+        current_tab = self.plot_tabs.currentWidget()
+        if not current_tab:
+            return
+            
+        canvas = current_tab.findChild(PlotCanvas)
+        if not canvas:
+            return
+        
+        # Ensure canvas has all required methods
+        self._ensure_canvas_compatibility(canvas)
+        
+        # Get available plot lines
+        plot_lines = canvas.get_plot_lines()
+        if not plot_lines:
+            QMessageBox.information(self, "Info", "No plot lines to remove")
+            return
+        
+        # Show selection dialog
+        from PyQt6.QtWidgets import QInputDialog
+        
+        selected_line, ok = QInputDialog.getItem(
+            self,
+            "Remove Plot Line",
+            "Select a plot line to remove:",
+            plot_lines,
+            0,
+            False
+        )
+        
+        if ok and selected_line:
+            success = canvas.remove_plot_line(selected_line)
+            if success:
+                self.status_bar.showMessage(f"Removed plot line: {selected_line}")
+            else:
+                QMessageBox.warning(self, "Warning", f"Failed to remove plot line: {selected_line}")
 
 
 def main():

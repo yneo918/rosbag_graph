@@ -7,13 +7,15 @@ A ROS2 bag file visualization tool - A PyQt6-based GUI application for loading a
 - **Load ROS2 bag files**: Supports both SQLite3 (.db3) and MCAP (.mcap) formats
 - **Topic exploration**: Display all topics in the bag file with search/filter functionality
 - **Message field selection**: Tree view to explore message structure and select fields to plot
-- **Array data support**: Handles ROS2 array types like Float32MultiArray, Int32MultiArray with individual element selection
+- **Array data support**: Handles ROS2 array types like Float32MultiArray, Int32MultiArray with individual element selection and range specification
 - **Multiple plot types**:
   - Time series plots: Display data changes over time (absolute or elapsed time)
   - X-Y plots: Show correlation between two fields
-- **Multi-tab support**: Manage multiple plots in separate tabs with renameable tabs
+- **Intelligent tab management**: Automatically creates new tabs when switching between different plot types or time modes
+- **Time range filtering**: Filter data by specific time ranges for focused analysis
 - **Plot customization**: Edit plot properties including title, axis labels, and legend entries
 - **Interactive plots**: Zoom, pan, save, and other standard Matplotlib features
+- **Field management**: Easy field selection with bulk operations and confirmation dialogs
 - **Keyboard shortcuts**: Quick actions for common operations
 
 ## Requirements
@@ -75,6 +77,7 @@ python3 src/ros2bag_visualizer.py
 5. **Create plots**:
    - Select plot type (Time Series or X-Y Plot)
    - Choose time display mode for time series (Absolute Time or Elapsed Time)
+   - Configure time range filtering if needed
    - Click "Add to Plot" button
    - Double-click selected fields for instant plotting
 
@@ -87,8 +90,25 @@ python3 src/ros2bag_visualizer.py
   - Bag Start Time: Time starts from the earliest message in the bag
   - Custom Time: Set a specific reference time
 
+#### Time Range Filtering
+- Enable "Filter by Time Range" checkbox
+- Set start and end times in seconds from bag beginning
+- Only data within the specified range will be plotted
+- Automatically adjusts range limits based on loaded bag duration
+
+#### Intelligent Tab Management
+- Tabs are automatically created when switching between:
+  - Different plot types (Time Series ↔ X-Y Plot)
+  - Different time modes (Absolute ↔ Elapsed Time)
+- Tab names reflect the plot configuration:
+  - "Time Series (Absolute) 1"
+  - "Time Series (Elapsed) 1" 
+  - "X-Y Plot 1"
+- Selected fields are preserved for easy re-plotting with different settings
+
 #### Compare Multiple Fields
 - Select multiple fields before clicking "Add to Plot" to overlay them on the same graph
+- Fields remain selected after plotting for easy experimentation
 
 #### X-Y Plots
 - Select at least 2 fields
@@ -106,10 +126,17 @@ python3 src/ros2bag_visualizer.py
 - Modify plot title, axis labels, and legend entries
 - Changes are applied immediately
 
+#### Field Management
+- **Individual removal**: Select fields and press Delete or use "Remove Selected"
+- **Bulk removal**: Use "Clear All" button with confirmation dialog
+- **Context menu**: Right-click for additional options
+- Selected fields persist after plotting for easy re-use
+
 #### Keyboard Shortcuts
 - `Ctrl+T`: Create new plot tab
 - `Ctrl+W`: Close current tab
 - `Ctrl+E`: Edit plot properties
+- `Ctrl+D`: Remove plot line
 - `F2`: Rename current tab
 - `Delete`: Remove selected fields from list
 
@@ -121,6 +148,27 @@ Each plot includes Matplotlib's standard toolbar:
 - **Home**: Return to original view
 - **Back/Forward**: Navigate view history
 - **Save**: Save plot as image
+
+## Workflow Examples
+
+### Comparing Time Display Modes
+1. Load bag file and select fields
+2. Create Time Series plot with Absolute Time → "Time Series (Absolute) 1" tab
+3. Change to Elapsed Time and plot again → "Time Series (Elapsed) 1" tab created automatically
+4. Switch between tabs to compare different time representations
+
+### Analyzing Specific Time Periods
+1. Load bag file
+2. Enable "Filter by Time Range"
+3. Set start/end times to focus on events of interest
+4. Create plots with filtered data
+5. Adjust time range and re-plot to compare different periods
+
+### Multi-perspective Analysis
+1. Select sensor data fields
+2. Create Time Series plot to see temporal behavior
+3. Switch to X-Y Plot to see correlations
+4. Use different tabs to compare various field combinations
 
 ## Troubleshooting
 
@@ -140,7 +188,16 @@ Make sure you have the required rosbag2 storage plugin installed.
 → Install the `ros-<distro>-rosbag2-storage-mcap` package
 
 ### High memory usage
-Large bag files load all messages into memory, which can result in high memory usage. Consider using smaller bag files or splitting large recordings.
+Large bag files load all messages into memory, which can result in high memory usage. Consider:
+- Using time range filtering to load only needed data
+- Using smaller bag files or splitting large recordings
+- Closing unused tabs to free memory
+
+### Performance with large arrays
+For messages with large arrays:
+- Use array range selection to display only relevant elements
+- Consider plotting individual array elements rather than entire arrays
+- Large arrays may impact loading and plotting performance
 
 ## Supported Message Types
 
@@ -149,6 +206,11 @@ Supports standard ROS2 message types including:
 - `sensor_msgs/PointCloud2`, `sensor_msgs/Image`
 - Various `geometry_msgs` package messages
 - Custom message types (if properly built and sourced)
+
+The tool automatically handles:
+- Python `array.array` types commonly used in ROS2 messages
+- Nested message structures
+- Various numeric and string data types
 
 ## License
 
